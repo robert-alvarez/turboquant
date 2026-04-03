@@ -18,6 +18,7 @@ A technical guide to what this implementation measures and why, written for read
 10. [The disk round-trip test](#10-the-disk-round-trip-test)
 11. [Reading the output tables](#11-reading-the-output-tables)
 12. [What the visualizations show](#12-what-the-visualizations-show)
+13. [Why the 7B model is different](#13-why-the-7b-model-is-different)
 
 ---
 
@@ -298,6 +299,62 @@ So the only source of error is the quantized prompt cache, and each position ind
 
 The term comes from sequence-to-sequence training in NLP: during training, you feed the ground truth at each step rather than the model's own predictions. The same idea applies here -- we force the "correct" context so we can evaluate each position in isolation.
 
+### A concrete walkthrough
+
+Suppose the original model, given the prompt "The cat sat on the", generates three tokens:
+
+```
+Position 1: "mat"
+Position 2: "and"
+Position 3: "purred"
+```
+
+That sequence — `["mat", "and", "purred"]` — is the ground truth.
+
+**Normal autoregressive generation** feeds the model's own output back as input:
+
+```
+Input: "The cat sat on the"     → predicts "mat"
+Input: "The cat sat on the mat" → predicts "and"
+Input: "The cat sat on the mat and" → predicts "purred"
+```
+
+Each prediction depends on the previous one. If position 1 goes wrong, everything downstream shifts onto a different path.
+
+**Teacher-forced evaluation** always feeds the ground truth, regardless of what the quantized model actually predicted:
+
+```
+Input: "The cat sat on the"     → quantized model predicts "mat"    ✓
+Input: "The cat sat on the mat" → quantized model predicts "slept"  ✗
+Input: "The cat sat on the mat and" → quantized model predicts "purred" ✓
+```
+
+At position 2, the quantized model predicted "slept" instead of "and". But at position 3, we don't feed "slept" — we feed the ground truth "and" anyway. The model gets a clean slate at every position. Position 2's mistake cannot infect position 3.
+
+Score: 2 out of 3 = **67%**.
+
+Without teacher forcing, that single early error would cascade. If the quantized model predicted "floor" at position 1:
+
+```
+Input: "The cat sat on the"       → predicts "floor"  ✗
+Input: "The cat sat on the floor" → predicts "was"    ✗ (reasonable for "floor"!)
+Input: "The cat sat on the floor was" → predicts "cold" ✗
+```
+
+Score: 0%. But the model isn't broken at every position — it's just that one early error sent it down a completely different path. Teacher forcing avoids this by scoring each position independently.
+
+So when we report **"4-bit: 8%"**, that means: across 200 independently-evaluated positions, the quantized model agreed with the original model's top prediction at only 16 of them. At 184 positions, quantization changed which token the model would output. That's severe distortion. When we report **"Skip L0: 100%"**, every single position matched — quantization didn't change the output at all.
+
+### Limitations of the Top-1 metric
+
+**It's a binary match on a hard argmax.** If the original model predicts token A with probability 0.35 and token B with probability 0.34, and quantization flips it to B=0.35, A=0.34 — that counts as a miss even though the distribution barely changed. Conversely, if quantization preserves the argmax but massively distorts the probabilities (A goes from 0.90 to 0.51), that counts as a hit. The metric doesn't distinguish confident predictions from coin flips.
+
+**Teacher forcing is optimistic.** In real generation, errors cascade. A model that gets 90% Top-1 under teacher forcing would likely perform worse under real autoregressive generation, because the 10% of wrong predictions would shift downstream context.
+
+**The cache grows with FP16 tokens during evaluation.** As teacher-forced generation proceeds, the model appends new KV entries in full FP16 precision. At position 200, there are 200 extra FP16 tokens in the attention window that weren't there at position 1. For a 168-token prompt, the cache has nearly doubled in size with unquantized tokens by the end of evaluation. This makes later positions easier than earlier ones, inflating the overall score.
+
+Despite these limitations, the metric is useful for **relative comparisons** between configurations. The absolute numbers are optimistic, but the ordering (4-bit is worse than 2-bit, Skip L0 helps, etc.) is reliable.
+
 ### A subtlety: the continuation tokens are unquantized
 
 In positions beyond the original prompt, the KV cache entries come from the model's own forward pass (processing g_1, g_2, etc.) and are stored in full precision. Only the prompt portion of the KV cache is quantized. This is the realistic deployment scenario: you quantize the prefilled cache to save memory, then continue generating with fresh (unquantized) KV entries.
@@ -545,6 +602,116 @@ Bar chart showing compression ratio (left axis) with a line showing bytes per ve
 **Left panel (MSE):** Scatter plot of <x_i, x_j> vs <x_hat_i, x_hat_j> for 5,000 random pairs. For MSE quantization, the cloud should cluster tightly around the y=x line but with a slight **downward bias** (points below the red line), reflecting the systematic shrinkage of inner products.
 
 **Right panel (MSE+QJL):** Same scatter plot for the prod quantizer. The cloud should be centered on the y=x line (unbiased) but with more **scatter** (higher variance). This is the visual representation of the bias-variance tradeoff discussed in Section 6.
+
+---
+
+## 13. Why the 7B model is different
+
+The Qwen2.5-7B-Instruct model exhibits a unique quantization failure that no other model in the Qwen2.5 family shares: a **non-monotonic accuracy collapse** at 4-5 bit widths that is entirely caused by a single layer.
+
+### The symptoms
+
+With full KV cache quantization at 1000 tokens, Top-1 accuracy across bit widths (n_generate=200):
+
+| Bits | 3B | 7B | 14B |
+|------|-----|-----|------|
+| 2 | ~86% | 96.5% | ~98% |
+| 3 | ~90% | 85.0% | ~98% |
+| 4 | ~92% | **7.5%** | ~100% |
+| 5 | ~100% | **46.5%** | ~100% |
+| 6 | ~100% | 97.5% | ~100% |
+| 8 | ~100% | 100% | ~100% |
+
+The 7B model's 4-bit accuracy (7.5%) is catastrophic, while coarser 2-bit (96.5%) and finer 6-bit (97.5%) both work well. This non-monotonic pattern — where adding more bits makes things worse before making them better — is unusual and counterintuitive.
+
+### The cause: Layer 0's keys
+
+Controlled experiments isolating individual layers show that **Layer 0's keys** are the sole cause at 1000+ token contexts. Nine scenarios, each with the full 200-token teacher-forced evaluation at 1000 tokens:
+
+| Scenario | 2b | 3b | 4b | 5b | 6b | 8b |
+|----------|------|------|------|------|------|------|
+| Full quantization | 96.5% | 85.0% | 7.5% | 46.5% | 97.5% | 100% |
+| Only L0 keys quantized | 97.0% | 88.0% | 6.0% | 45.5% | 97.5% | 100% |
+| Skip L0 keys only | 96.5% | 100% | 100% | 100% | 100% | 100% |
+| Only L27 keys quantized | 100% | 100% | 100% | 100% | 100% | 100% |
+
+"Only L0 keys quantized" reproduces the failure pattern almost exactly. "Skip L0 keys only" gives 100% at every bit width. Layer 27, despite having extreme key norms (11.8x median), causes zero damage when quantized. Values at either layer are never the problem.
+
+### Why Layer 0 is special in the 7B
+
+The 7B model's Layer 0 has anomalously large key activations:
+
+| Model | L0 Key Norm | L0/Median | L0 Max Channel Var |
+|-------|-------------|-----------|---------------------|
+| 3B | 172.3 | 8.4x | 3,367 |
+| **7B** | **274.0** | **13.2x** | **9,604** |
+| 14B | 37.9 | 1.8x | 130 |
+| 32B | 37.9 | 2.0x | 129 |
+
+The 14B and 32B models have tame Layer 0 norms. The 7B is extreme — and this is not explained by its weight matrices. The 7B's key projection weight norm ratio (1.47x median) is actually less extreme than the 3B's (1.82x). The extreme activations emerge from what the model learns during training, not from the architecture.
+
+The 7B also has the fewest layers of any Qwen2.5 model (28 vs 36/48/64), which may force it to concentrate information differently in early layers. But this is speculative.
+
+### The non-monotonic puzzle
+
+The most striking aspect is that 2-bit quantization (96.5%) outperforms 3-bit (85.0%) and dramatically outperforms 4-bit (7.5%). This is not a statistical artifact — it reproduces consistently across context lengths and token counts.
+
+We do not have a full mechanistic explanation. The v1 investigation measured Layer 0's attention KL divergence at each bit width and found it is similarly high at 2-bit (72.9) and 4-bit (74.1), yet the downstream effects are completely different. This means the *magnitude* of attention distortion is not what matters — it's the *pattern* of distortion. Something about the 4-bit Lloyd-Max codebook's interaction with Layer 0's specific activation distribution creates systematically wrong attention patterns, while the 2-bit codebook's coarser errors average out more benignly.
+
+### Context length sensitivity
+
+The failure pattern depends on prompt length (all with n_generate=200):
+
+| Context | 2b | 3b | 4b | 5b | 6b | 8b |
+|---------|------|------|------|------|------|------|
+| 168 tok | 78.5% | 58.5% | 4.0% | 69.5% | 93.0% | 99.5% |
+| 1000 tok | 96.5% | 85.0% | 7.5% | 46.5% | 97.5% | 100% |
+| 5000 tok | 97.5% | 88.0% | 8.0% | 41.0% | 84.5% | 100% |
+
+The effect of context length is bit-width-dependent:
+
+- **Low bits (2-3b):** longer context helps. 2-bit goes from 78.5% at 168 tokens to 97.5% at 5000. The softmax denominator grows with context length, diluting per-token quantization errors.
+- **4-bit:** broken at every context length (4-8%).
+- **5-bit:** gets worse with longer context (69.5% → 41.0%). The accumulated quantization error across more tokens overwhelms the softmax dilution.
+- **6-bit:** also degrades at long context (93.0% → 84.5%).
+
+At short context (168 tokens), the "Layer 0 is the sole cause" claim weakens. Skipping Layer 0 at 168 tokens gives 83.5% at 2-bit (not 100%), meaning other layers contribute meaningful damage when there are few tokens to dilute errors.
+
+### The residual window doesn't help
+
+The residual window (keeping the last 128 tokens in FP16) has minimal effect on the Layer 0 problem because Layer 0's keys are quantized for ALL token positions, including those in the window. The window preserves recent tokens' values from quantization error at other layers, but it cannot fix the attention distortion caused by Layer 0's quantized keys being used in attention score computation.
+
+Window deltas (Full quant + W=128 minus Full quant) at each context length:
+
+| Context | 2b | 3b | 4b | 5b | 6b | 8b |
+|---------|------|------|------|------|------|------|
+| 168 tok (40 quantized) | +1.5 | +14.5 | +22.5 | +11.0 | +4.0 | +0.5 |
+| 1000 tok (872 quantized) | -0.5 | +2.0 | +0.5 | +10.0 | +1.0 | +0.0 |
+| 5000 tok (4872 quantized) | +1.0 | -1.0 | +1.0 | +4.5 | +2.5 | +0.0 |
+
+The window helps modestly at 168 tokens (where 76% of tokens are in the FP16 window), but at 1000+ tokens it provides negligible improvement. The fundamental issue — Layer 0's quantized keys distorting attention patterns — is not addressable by keeping recent tokens in FP16.
+
+### Layer exemption is the fix
+
+Skipping Layer 0's key quantization (keeping them in FP16) completely resolves the issue:
+
+| Context | 2b | 3b | 4b | 5b | 6b | 8b |
+|---------|------|------|------|------|------|------|
+| 168 tok | 83.5% | 96.0% | 97.5% | 95.5% | 96.0% | 99.5% |
+| 1000 tok | 96.5% | 100% | 100% | 100% | 100% | 100% |
+| 5000 tok | 98.5% | 99.5% | 100% | 100% | 100% | 100% |
+
+At 1000+ tokens and 3+ bits, layer exemption gives near-perfect accuracy. Adding the residual window on top gives marginal further improvement at short context only.
+
+The storage cost is negligible: 1 of 28 layers keeps keys in FP16, affecting ~3.6% of key storage. The implementation's `identify_outlier_layers()` function detects such layers automatically using a key norm threshold (>4x median across layers).
+
+### What we still don't know
+
+1. **Why 4-bit specifically fails.** The non-monotonic pattern is robust and reproducible, but we lack a mechanistic explanation for why the 4-bit codebook interacts catastrophically with Layer 0's activation distribution while 2-bit (coarser) and 6-bit (finer) do not.
+
+2. **Why the 7B develops extreme Layer 0 activations.** The architecture (fewest layers in the Qwen2.5 family) and training process both may contribute, but we cannot isolate the cause from the available data.
+
+3. **Why Layer 27's extreme norms are harmless.** Layer 27 (the last layer) has 11.8x median key norm but is completely robust to quantization. Layer 0 (the first layer) has 13.2x median key norm and is catastrophically fragile. The functional difference — what role these layers' high-norm keys serve in the attention mechanism — is not understood.
 
 ---
 
