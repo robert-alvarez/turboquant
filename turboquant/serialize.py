@@ -41,35 +41,40 @@ def serialize_compressed_kv(
     mode_int = 0 if mode == "mse" else 1
     n_levels = 1 << bits
 
+    # Build the entire file in memory first, then write once.
+    # This avoids hundreds of small writes and lets the OS do a single large I/O.
+    buf = bytearray()
+    buf += MAGIC
+    buf += struct.pack("<I", VERSION)
+    buf += struct.pack("<I", mode_int)
+    buf += struct.pack("<I", bits)
+    buf += struct.pack("<I", d)
+    buf += struct.pack("<I", n_layers)
+    buf += struct.pack("<I", n_heads)
+    buf += struct.pack("<I", n_tokens)
+
+    buf += rotation_matrix.cpu().float().numpy().tobytes()
+    buf += codebook.astype(np.float64).tobytes()
+
+    if mode_int == 1 and qjl_matrix is not None:
+        buf += qjl_matrix.cpu().float().numpy().tobytes()
+
+    block_idx = 0
+    for layer in range(n_layers):
+        for head in range(n_heads):
+            indices, norms = all_indices[block_idx]
+            buf += pack_indices_fast(indices, bits)
+            buf += norms.cpu().float().numpy().tobytes()
+
+            if mode_int == 1 and qjl_data is not None:
+                qjl_signs, res_norms = qjl_data[block_idx]
+                buf += pack_signs_fast(qjl_signs)
+                buf += res_norms.cpu().float().numpy().tobytes()
+
+            block_idx += 1
+
     with open(filepath, "wb") as f:
-        f.write(MAGIC)
-        f.write(struct.pack("<I", VERSION))
-        f.write(struct.pack("<I", mode_int))
-        f.write(struct.pack("<I", bits))
-        f.write(struct.pack("<I", d))
-        f.write(struct.pack("<I", n_layers))
-        f.write(struct.pack("<I", n_heads))
-        f.write(struct.pack("<I", n_tokens))
-
-        f.write(rotation_matrix.cpu().float().numpy().tobytes())
-        f.write(codebook.astype(np.float64).tobytes())
-
-        if mode_int == 1 and qjl_matrix is not None:
-            f.write(qjl_matrix.cpu().float().numpy().tobytes())
-
-        block_idx = 0
-        for layer in range(n_layers):
-            for head in range(n_heads):
-                indices, norms = all_indices[block_idx]
-                f.write(pack_indices_fast(indices, bits))
-                f.write(norms.cpu().float().numpy().tobytes())
-
-                if mode_int == 1 and qjl_data is not None:
-                    qjl_signs, res_norms = qjl_data[block_idx]
-                    f.write(pack_signs_fast(qjl_signs))
-                    f.write(res_norms.cpu().float().numpy().tobytes())
-
-                block_idx += 1
+        f.write(buf)
 
 
 def deserialize_compressed_kv(filepath: str) -> dict:
