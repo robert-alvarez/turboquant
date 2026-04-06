@@ -98,8 +98,11 @@ eval/                        # Evaluation harness (+ transformers, matplotlib)
     metrics.py               # Quality metrics + teacher-forced generation
     model.py                 # Model loading (text + VLM)
     visualize.py             # Four matplotlib plots
+    flashblade_worker.py     # Per-GPU worker for concurrent storage benchmarks
 
 run_eval.py                  # CLI entry point
+bench_flashblade.py          # FlashBlade storage benchmark (multi-GPU, GDS)
+flashblade-benchmark-results.md  # Benchmark results and analysis
 learners-guide.md            # In-depth technical guide (math, metrics, design decisions)
 ```
 
@@ -140,10 +143,84 @@ All models with head_dim=128 work with precomputed codebooks (auto-recomputed ot
 
 Tested on NVIDIA GB10 (128 GB unified memory).
 
+## FlashBlade storage benchmark
+
+`bench_flashblade.py` benchmarks KV cache checkpoint/restore on Everpure FlashBlade storage with GPU Direct Storage (GDS). It measures the end-to-end cost of swapping LLM sessions to and from storage — the critical operation for serving many concurrent users on a fixed GPU fleet.
+
+### What it measures
+
+The benchmark runs five tests:
+
+1. **Storage I/O** — Single-GPU compress/write/read/decompress timing at each context length (1K-30K tokens) and bit width. Reports per-phase latency, compression ratio, and cosine similarity.
+2. **Concurrent multi-GPU checkpoint/restore** — All GPUs simultaneously checkpoint a session, measuring aggregate throughput and per-worker variance under contention.
+3. **Session capacity** — Sessions per terabyte at each context length and compression level.
+4. **Session migration** — Compress on GPU 0, write to disk, read back, restore on GPU 1, then verify generation quality with teacher-forced Top-1 accuracy. Proves the compressed session produces identical predictions to the original.
+5. **TurboQuant ON vs OFF with GDS** — The key comparison. Tests four configurations (FP16, FP16+GDS, TQ 3-bit, TQ 3-bit+GDS) at multiple context lengths with concurrent workers. Shows how compression + GDS combine.
+
+### Key results (7 GPUs concurrent, Qwen2.5-7B-Instruct)
+
+**Restore latency** (user-facing — the delay when a session is swapped back in):
+
+| Context | FP16 | TQ+GDS | Speedup |
+|---------|------|--------|---------|
+| 10K tokens (573 MB) | 1,105 ms | 131 ms | **8.4x** |
+| 30K tokens (1.72 GB) | 2,294 ms | 344 ms | **6.7x** |
+| 50K tokens (2.87 GB) | 3,976 ms | 619 ms | **6.4x** |
+
+**Round-trip** (full checkpoint + restore cycle — determines GPU utilization):
+
+| Context | FP16 | TQ+GDS | Speedup |
+|---------|------|--------|---------|
+| 10K tokens | 1,961 ms | 1,647 ms | 1.2x |
+| 30K tokens | 7,939 ms | 4,266 ms | 1.9x |
+| 50K tokens | 18,483 ms | 3,311 ms | **5.6x** |
+
+The advantage grows with context length. At 50K tokens, TQ+GDS is 5.6x faster while using 4.9x less storage. See [flashblade-benchmark-results.md](flashblade-benchmark-results.md) for full results.
+
+### Running
+
+```bash
+# Standard benchmark (no GDS, ~7 minutes)
+python bench_flashblade.py \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --context-lengths 1000,5000,10000,30000 \
+  --bits 3,4 \
+  --n-generate 50
+
+# With GPU Direct Storage (adds GDS variants to Benchmark 5, ~10 minutes)
+python bench_flashblade.py \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --bits 3,4 \
+  --n-generate 50 \
+  --gds
+
+# Point output to FlashBlade mount for accurate I/O timing
+python bench_flashblade.py \
+  --output-dir /mnt/flashblade/tq_bench \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --gds
+```
+
+| Flag | Description |
+|------|-------------|
+| `--model MODEL` | HuggingFace model ID (default: Qwen/Qwen2.5-7B-Instruct) |
+| `--gpus 0,1,2,...` | Comma-separated GPU IDs (default: auto-detect GPUs with >20 GB free) |
+| `--context-lengths N,N,...` | Context lengths to benchmark (default: 1000,5000,10000,30000) |
+| `--bits B,B,...` | Bit widths for uniform quantization (default: 3,4) |
+| `--migration-bits B` | Bit width for the session migration test (default: 3) |
+| `--n-generate N` | Tokens for teacher-forced migration verification (default: 50) |
+| `--output-dir DIR` | Where to write temp files during benchmarks (default: ./output/flashblade_bench) |
+| `--gds` | Enable GPU Direct Storage via kvikio (requires kvikio and GDS-capable storage) |
+
+GDS requires `kvikio` and a storage target accessible via RDMA. Without `--gds`, Benchmark 5 still runs but only compares FP16 vs TQ using CPU-mediated I/O.
+
 ## Dependencies
 
 ```
-torch, torchvision, numpy, scipy, matplotlib, transformers, accelerate, qwen-vl-utils
+torch, torchvision, numpy, scipy, matplotlib, transformers, accelerate, qwen-vl-utils, kvikio (for GDS benchmarks)
 ```
 
 The `.env` file in this directory stores `HF_TOKEN` and is auto-loaded at startup.
@@ -151,6 +228,7 @@ The `.env` file in this directory stores `HF_TOKEN` and is auto-loaded at startu
 ## Further reading
 
 - **[Learner's guide](learners-guide.md)** — In-depth explanation of the algorithms, metrics, evaluation design, and results. Covers: why rotation works, the Beta distribution and Lloyd-Max quantization, MSE vs QJL bias-variance tradeoff, teacher-forced evaluation, outlier channels, residual windows, RoPE compatibility, and QJL's role in vector search.
+- **[FlashBlade benchmark results](flashblade-benchmark-results.md)** — Full checkpoint/restore benchmark on Everpure FlashBlade with GPU Direct Storage. Shows how TurboQuant + GDS delivers 6-8x faster restore and 4.9x more sessions per TB.
 - **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., 2025
 - **[QJL paper](https://arxiv.org/abs/2406.03482)** — The 1-bit sign quantization used in Algorithm 2
 - **[PolarQuant](https://arxiv.org/abs/2502.02617)** — Alternative approach using polar coordinates (not random rotation)

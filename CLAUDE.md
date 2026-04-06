@@ -20,6 +20,9 @@ turboquant/
         gpu_eval.py          # GPU evaluation (uniform, prod, outlier, window, top-k)
         disk_eval.py         # Disk round-trip compression tests
     run_eval.py              # CLI entry point
+    bench_flashblade.py      # FlashBlade storage benchmark (multi-GPU, GDS)
+    eval/flashblade_worker.py  # Per-GPU worker for concurrent benchmarks
+    flashblade-benchmark-results.md  # Benchmark results and analysis
     learners-guide.md        # In-depth technical guide
     output/                  # Generated PNGs and .tqkv files
     .venv/                   # Python 3.12 virtual environment
@@ -34,7 +37,7 @@ The `turboquant/` package depends only on torch, numpy, scipy. The `eval/` modul
 source .venv/bin/activate
 ```
 
-Dependencies: `torch`, `torchvision`, `numpy`, `scipy`, `matplotlib`, `transformers`, `accelerate`, `qwen-vl-utils`
+Dependencies: `torch`, `torchvision`, `numpy`, `scipy`, `matplotlib`, `transformers`, `accelerate`, `qwen-vl-utils`, `kvikio` (for GDS benchmarks)
 
 The `.env` file in this directory contains `HF_TOKEN` and is auto-loaded at startup.
 
@@ -68,6 +71,65 @@ python run_eval.py --min-tokens 5000 --eval-top1
 python run_eval.py --model Qwen/Qwen2.5-VL-3B-Instruct --image path/to/image.png
 python run_eval.py --model Qwen/Qwen2.5-VL-7B-Instruct --image path/to/image.png --eval-top1
 ```
+
+## FlashBlade storage benchmark
+
+`bench_flashblade.py` measures checkpoint/restore performance for KV caches on Everpure FlashBlade storage. It loads a real model, captures KV caches at multiple context lengths, then runs five benchmarks:
+
+1. **Storage I/O** — Single-GPU compress/write/read/decompress at each context length and bit width. Measures per-phase timing, compression ratio, and cosine similarity. Includes both uniform and mixed-precision (outlier) configs.
+2. **Concurrent multi-GPU checkpoint/restore** — Spawns one worker per GPU, each independently checkpointing and restoring a session. Measures aggregate throughput and per-worker variance.
+3. **Session capacity** — Computes sessions per terabyte at each context length and compression level.
+4. **Session migration** — Full GPU-to-disk-to-GPU migration: compress on GPU 0, write to disk, read back, decompress, restore on GPU 1, verify with teacher-forced generation. Reports Top-1 accuracy and per-phase latency. Uses layer exemption to keep outlier layers' keys in FP16.
+5. **TurboQuant ON vs OFF with GPU Direct Storage** — Compares four configurations (FP16, FP16+GDS, TQ, TQ+GDS) with concurrent workers. This is the key benchmark: it shows how compression + GDS combine to speed up restore (6-8x faster than FP16) and how the advantage grows with context length.
+
+Each worker runs as a separate process (`eval/flashblade_worker.py`) with `CUDA_VISIBLE_DEVICES` set, communicating results via JSON files in a shared temp directory.
+
+```bash
+# Standard benchmark (Benchmarks 1-5, no GDS, ~7 minutes)
+python bench_flashblade.py \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --context-lengths 1000,5000,10000,30000 \
+  --bits 3,4 \
+  --n-generate 50
+
+# With GPU Direct Storage (adds GDS variants to Benchmark 5, ~10 minutes)
+python bench_flashblade.py \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --context-lengths 1000,10000,30000 \
+  --bits 3,4 \
+  --n-generate 50 \
+  --gds
+
+# Point output to FlashBlade mount for accurate I/O timing
+python bench_flashblade.py \
+  --output-dir /mnt/flashblade/tq_bench \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --gds
+```
+
+### FlashBlade benchmark CLI flags
+
+| Flag | Description |
+|------|-------------|
+| `--model MODEL` | HuggingFace model ID (default: Qwen/Qwen2.5-7B-Instruct) |
+| `--gpus 0,1,2,...` | Comma-separated GPU IDs (default: auto-detect GPUs with >20 GB free) |
+| `--context-lengths N,N,...` | Context lengths to benchmark (default: 1000,5000,10000,30000) |
+| `--bits B,B,...` | Bit widths for uniform quantization (default: 3,4) |
+| `--migration-bits B` | Bit width for the session migration test (default: 3) |
+| `--n-generate N` | Tokens for teacher-forced migration verification (default: 50) |
+| `--output-dir DIR` | Where to write temp files during benchmarks (default: ./output/flashblade_bench) |
+| `--gds` | Enable GPU Direct Storage via kvikio (requires kvikio and GDS-capable storage) |
+
+### GDS requirements
+
+GPU Direct Storage requires `kvikio` and a storage target accessible via RDMA. The FlashBlade is mounted at `/mnt/data` via NFS4 with RDMA enabled. GDS bypasses the CPU on the I/O path — reads go directly from storage to GPU memory, and the decompression (bit unpack + inverse rotation) runs on GPU instead of CPU.
+
+Without `--gds`, Benchmark 5 still runs but only compares FP16 vs TQ using CPU-mediated I/O. The GDS variants are the ones that show the real FlashBlade advantage.
+
+Results are written to `flashblade-benchmark-results.md`.
 
 ## What it implements
 

@@ -36,6 +36,8 @@ from .bitpack import (
 from .serialize import (
     MAGIC,
     VERSION,
+    write_direct,
+    read_direct,
     serialize_compressed_kv,
     deserialize_compressed_kv,
     dequantize_from_disk,
@@ -48,6 +50,6 @@ __all__ = [
     "TurboQuantMSE", "TurboQuantProd", "TurboQuantOutlier",
     "pack_indices", "unpack_indices", "pack_signs", "unpack_signs",
     "pack_indices_fast", "unpack_indices_fast", "pack_signs_fast", "unpack_signs_fast",
-    "MAGIC", "VERSION",
+    "MAGIC", "VERSION", "write_direct", "read_direct",
     "serialize_compressed_kv", "deserialize_compressed_kv", "dequantize_from_disk",
 ]
